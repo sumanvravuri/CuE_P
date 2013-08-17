@@ -287,7 +287,7 @@ class QP_object:
 def calculate_primal_dual_step_size(primal_step_size, dual_step_size, 
                                     residual_lagrangian, residual_inequality, residual_equality, residual_complementary_slackness,
                                     x_step, slacks_step, dual_inequality_step, 
-                                    slacks, dual_inequality, second_order_mat):
+                                    slacks, dual_inequality, second_order_mat, use_min=False):
     if primal_step_size < 0.0:
         print "WARNING, primal_step_size, ", primal_step_size, "is less than zero (means that there is probably a numerical error, setting to 0.0"
         primal_step_size = 0.0
@@ -299,7 +299,8 @@ def calculate_primal_dual_step_size(primal_step_size, dual_step_size,
         quit()    
     
     min_step_size = min([primal_step_size, dual_step_size])
-    
+    if use_min:
+        return min_step_size, min_step_size
     new_lagrangian_residual = np.linalg.norm((1-min_step_size) * residual_lagrangian, ord=float("inf"))
     new_inequality_residual = np.linalg.norm((1-min_step_size) * residual_inequality, ord=float("inf"))
     new_equality_residual = np.linalg.norm((1-min_step_size) * residual_equality, ord=float("inf"))
@@ -322,10 +323,201 @@ def calculate_primal_dual_step_size(primal_step_size, dual_step_size,
         return primal_step_size, dual_step_size
     else:
         return min_step_size, min_step_size
+
+def interior_point_qp_augmented_lagrangian(second_order_mat, first_order_vec, A_equality, b_equality, A_inequality, b_inequality, 
+                                           tol=1E-8, max_iterations=100, x_0=None, slack_0=None, dual_inequality_0=None, 
+                                           dual_equality_0=None, tau=None, seed=0, verbose = False, use_unequal_primal_dual_steps=True):
+    """minimizes function 1/2 x'(second_order_mat)x + (first_order_vec)'x subject to (A_inequality)x >= b, (A_equality)x = b
+    using an interior point algorithm
+    vu_0 is the dual variable for Ax-y = b condition"""
+    start_time = datetime.datetime.now()
+    solver_times = list()
+    np.random.seed(seed)
+    num_equality_constraints = len(b_equality)
+    num_inequality_constraints = len(b_inequality)
+    num_dims = len(first_order_vec)
+    #TODO: better initial parameters
+    if x_0 == None:
+        x = np.dot(sl.pinv(A_equality), b_equality)
+        norm_residual = np.linalg.norm(np.dot(A_equality, x) - b_equality, ord=2)
+        if norm_residual > tol:
+            print "equality constraints are not satisfiable since residual", norm_residual, "is greater than", tol, "tolerance... quitting"
+            sys.exit(3)
+    else:
+        x = x_0
+    if slack_0 == None:
+        slacks = np.random.rand(num_inequality_constraints) + 1.
+    else:
+        slacks = slack_0
+    if dual_inequality_0 == None:
+        dual_inequality = np.random.rand(num_inequality_constraints) + 1.
+    else:
+        dual_inequality = dual_inequality_0
+    if dual_equality_0 == None:
+        dual_equality = np.random.rand(num_equality_constraints) + 1.
+    else:
+        dual_equality = dual_equality_0
+    if tau == None:
+        if max_iterations <= 5:
+            tau = np.ones((max_iterations,)) * 0.95
+        else:
+            tau = np.hstack((np.ones((5,)) * 0.5, np.ones(max_iterations-5,) * 0.95))
+    zero_mat = np.zeros((num_equality_constraints,num_equality_constraints))
+    residual_lagrangian = np.dot(second_order_mat, x) + first_order_vec - np.dot(A_equality.T, dual_equality) - np.dot(A_inequality.T, dual_inequality)
+    residual_inequality = np.dot(A_inequality, x) - b_inequality - slacks
+    residual_equality = np.dot(A_equality, x) - b_equality
+    residual_complementary_slackness = dual_inequality * slacks
     
+    residual_augmented_lagrangian = residual_lagrangian + np.dot(A_inequality.T, (residual_complementary_slackness + residual_inequality * dual_inequality)/slacks)
+    
+    #TRY A REDUCED SYSTEM
+    reduced_residual = np.hstack((residual_augmented_lagrangian, residual_equality))
+    augmented_second_order_mat = second_order_mat + np.dot(A_inequality.T, A_inequality * (dual_inequality/slacks)[:, np.newaxis])
+    
+    solver_start_time = datetime.datetime.now()
+    affine_step = _schur_complement_solve_symmetric_ul_pd(augmented_second_order_mat, A_equality, zero_mat, 
+                                                          -reduced_residual, A_is_diag=False)
+    solver_end_time = datetime.datetime.now()
+    solver_times.append(solver_end_time - solver_start_time)
+    x_affine_step = affine_step[:num_dims]
+    dual_equality_affine_step = -affine_step[num_dims:]
+    dual_inequality_affine_step = -(dual_inequality + (residual_inequality + np.dot(A_inequality, x_affine_step) * (dual_inequality / slacks)))
+    slacks_affine_step = -(residual_complementary_slackness + slacks * dual_inequality_affine_step) / dual_inequality
+    x += x_affine_step
+    dual_equality += dual_equality_affine_step
+    slacks += slacks_affine_step
+    slacks = np.abs(slacks)
+    slacks[np.where(slacks < 1.0)] = 1.0
+    dual_inequality += dual_inequality_affine_step
+    dual_inequality = np.abs(dual_inequality)
+    dual_inequality[np.where(dual_inequality < 1.0)] = 1.0
+    
+    is_solved = False
+    print "-------------------------------------------------------------------------------------------------"
+    print "|iter\t|lagrange res.\t|ineq. res.\t|eq. res.\t|CompSlack res.\t|primal value \t\t|"
+    for iteration in range(max_iterations):
+        print "-------------------------------------------------------------------------------------------------"
+#        print "at iteration", iteration
+        if verbose:
+            print "minimum of dual inequality is", np.min(dual_inequality)
+            print "minimum of slacks is", np.min(slacks)
+        #check if KKT conditions satisfied
+        residual_lagrangian = np.dot(second_order_mat, x) + first_order_vec - np.dot(A_equality.T, dual_equality) - np.dot(A_inequality.T, dual_inequality)
+        residual_inequality = np.dot(A_inequality, x) - b_inequality - slacks
+        residual_equality = np.dot(A_equality, x) - b_equality
+        residual_complementary_slackness = dual_inequality * slacks
+        augmented_second_order_mat = second_order_mat + np.dot(A_inequality.T, A_inequality * (dual_inequality/slacks)[:, np.newaxis])
+        inv_augmented_second_order_mat = sl.inv(augmented_second_order_mat)
+        #TODO: check if tolerance condition is correct
+        max_residual = max([np.linalg.norm(residual_lagrangian, ord=float("inf")), np.linalg.norm(residual_inequality, ord=float("inf")), 
+                            np.linalg.norm(residual_equality, ord=float("inf")), np.linalg.norm(residual_complementary_slackness, ord=float("inf"))])
+        if max_residual < tol:
+            is_solved = True
+            break
+        
+        mu = np.sum(residual_complementary_slackness) / num_inequality_constraints
+        residual_augmented_lagrangian = residual_lagrangian + np.dot(A_inequality.T, (residual_complementary_slackness + residual_inequality * dual_inequality)/slacks)
+        # update KKT matrix and solve Newton equation for affine step
+        reduced_residual = np.hstack((residual_augmented_lagrangian, residual_equality))
+        solver_start_time = datetime.datetime.now()
+        affine_step = _schur_complement_solve_symmetric_ul_pd(augmented_second_order_mat, A_equality, zero_mat, 
+                                                              -reduced_residual, A_is_diag=False, 
+                                                              A_inv=inv_augmented_second_order_mat)
+        solver_end_time = datetime.datetime.now()
+        solver_times.append(solver_end_time - solver_start_time)
+        x_affine_step = affine_step[:num_dims]
+        dual_inequality_affine_step = -(dual_inequality + (residual_inequality + np.dot(A_inequality, x_affine_step) * (dual_inequality / slacks)))
+        slacks_affine_step = -(residual_complementary_slackness + slacks * dual_inequality_affine_step) / dual_inequality
+        
+        #TODO: get correct affine step size
+        neg_indices = np.where(dual_inequality_affine_step < 0.0)
+        if neg_indices[0].size > 0:
+            dual_inequality_affine_step_size = min(-dual_inequality[neg_indices] / dual_inequality_affine_step[neg_indices])
+        else:
+            dual_inequality_affine_step_size = 1.0
+        
+        neg_indices = np.where(slacks_affine_step < 0.0)
+        if neg_indices[0].size > 0:
+            slacks_affine_step_size = min(-slacks[neg_indices] / slacks_affine_step[neg_indices])
+        else:
+            slacks_affine_step_size = 1.0
+        affine_step_size = max([min([dual_inequality_affine_step_size, slacks_affine_step_size, 1.]), 0.0])
+        
+        slacks_affine = slacks + affine_step_size * slacks_affine_step
+        dual_inequality_affine = dual_inequality + affine_step_size * dual_inequality_affine_step
+        mu_affine = np.dot(slacks_affine, dual_inequality_affine) / num_inequality_constraints
+        sigma = (mu_affine / mu) ** 3
+        #NOT sure if this is the way to handle the problem
+        if sigma > 1.0:
+            sigma = 1.0
+        if verbose: 
+            print "sigma is", sigma
+            print "mu is", mu
+            print "sigma * mu is", sigma * mu
+        residual_corrected_complementary_slackness = residual_complementary_slackness + slacks_affine * dual_inequality_affine - sigma * mu
+        residual_corrected_augmented_lagrangian = residual_lagrangian + np.dot(A_inequality.T, (residual_corrected_complementary_slackness + residual_inequality * dual_inequality)/slacks)
+        reduced_corrected_residual = np.hstack((residual_corrected_augmented_lagrangian, residual_equality))
+        solver_start_time = datetime.datetime.now()
+        step = _schur_complement_solve_symmetric_ul_pd(augmented_second_order_mat, A_equality, zero_mat, 
+                                                       -reduced_corrected_residual, A_is_diag=False,
+                                                       A_inv=inv_augmented_second_order_mat)
+        solver_end_time = datetime.datetime.now()
+        solver_times.append(solver_end_time - solver_start_time)
+        #TODO: get correct primal/dual step sizes
+        x_step = step[:num_dims]
+        dual_equality_step = -step[num_dims:num_dims+num_equality_constraints]
+        dual_inequality_step = -(residual_corrected_complementary_slackness / dual_inequality + residual_inequality + np.dot(A_inequality, x_step)) * (dual_inequality / slacks)
+        slacks_step = -(residual_corrected_complementary_slackness + slacks * dual_inequality_step) / dual_inequality
+        
+        neg_indices = np.where(dual_inequality_step < 0.0)
+        if neg_indices[0].size > 0:
+            dual_inequality_step_size = min(-tau[iteration] * dual_inequality[neg_indices] / dual_inequality_step[neg_indices])
+        else:
+            dual_inequality_step_size = 1.0
+        
+        neg_indices = np.where(slacks_step < 0.0)
+        if neg_indices[0].size > 0:
+            slacks_step_size = min(-tau[iteration] * slacks[neg_indices] / slacks_step[neg_indices])
+        else:
+            slacks_step_size = 1.0
+        if verbose:
+            print "dual_inequality_step_size is", dual_inequality_step_size
+            print "slacks_step_size is", slacks_step_size
+        
+        primal_step_size, dual_step_size = calculate_primal_dual_step_size(slacks_step_size, dual_inequality_step_size, 
+                                                                           residual_lagrangian, residual_inequality, 
+                                                                           residual_equality, residual_complementary_slackness,
+                                                                           x_step, slacks_step, dual_inequality_step, 
+                                                                           slacks, dual_inequality, second_order_mat, 
+                                                                           use_min=(use_unequal_primal_dual_steps == False))
+        
+        if verbose:
+            print "(primal, dual) step size is", (primal_step_size, dual_step_size)
+        
+        x += x_step * primal_step_size
+        slacks += slacks_step * primal_step_size
+        dual_inequality += dual_inequality_step * dual_step_size
+        dual_equality += dual_equality_step * dual_step_size
+        primal_value = 0.5 * np.dot(np.dot(G,x),x) + np.dot(first_order_vec, x)
+        print "|%d\t|%.7f\t|%.7f\t|%.7f\t|%.7f\t|%.7f\t|" % (iteration, np.linalg.norm(residual_lagrangian, ord=float("inf")),
+                                                             np.linalg.norm(residual_inequality, ord=float("inf")), np.linalg.norm(residual_equality, ord=float("inf")),
+                                                             np.linalg.norm(residual_complementary_slackness, ord=float("inf")), primal_value)
+    end_time = datetime.datetime.now()
+    run_time = end_time - start_time
+    print "Solver ran for", run_time
+    print "average run_time for each solve call was", sum(solver_times, datetime.timedelta()) / len(solver_times)
+    print "with a total time", sum(solver_times, datetime.timedelta()) 
+    if is_solved:
+        print "solution found, returning parameters"
+        print "primal value is", primal_value
+        return x
+    else:
+        print "failed to find solution, returning None"
+        return None
+
 def interior_point_qp(second_order_mat, first_order_vec, A_equality, b_equality, A_inequality, b_inequality, 
-                                    tol=1E-8, max_iterations=100, x_0=None, slack_0=None, dual_inequality_0=None, 
-                                    dual_equality_0=None, tau=None, seed=0, verbose = False):
+                      tol=1E-8, max_iterations=100, x_0=None, slack_0=None, dual_inequality_0=None, 
+                      dual_equality_0=None, tau=None, seed=0, verbose = False):
     """minimizes function 1/2 x'(second_order_mat)x + (first_order_vec)'x subject to (A_inequality)x >= b, (A_equality)x = b
     using an interior point algorithm
     vu_0 is the dual variable for Ax-y = b condition"""
@@ -387,10 +579,19 @@ def interior_point_qp(second_order_mat, first_order_vec, A_equality, b_equality,
     
     residual_reduced_kkt = residual_inequality + (residual_complementary_slackness / dual_inequality)
     residual = np.hstack((residual_lagrangian, residual_equality, residual_reduced_kkt))
+    residual_augmented_lagrangian = residual_lagrangian + np.dot(A_inequality.T, (residual_complementary_slackness + residual_inequality * dual_inequality)/slacks)
+    
+    #TRY A REDUCED SYSTEM
+#    reduced_residual = np.hstack((residual_augmented_lagrangian, residual_equality))
+#    augmented_second_order_mat = second_order_mat + np.dot(A_inequality.T, A_inequality * (dual_inequality/slacks)[:, np.newaxis])
     neg_residual = -residual
     
     solver_start_time = datetime.datetime.now()
-    affine_step = sl.solve(reduced_kkt_matrix, neg_residual)
+#    affine_step = sl.solve(reduced_kkt_matrix, neg_residual)
+    affine_step = _schur_complement_solve_symmetric(reduced_kkt_matrix[:num_dims+num_equality_constraints,:num_dims+num_equality_constraints], 
+                                                    reduced_kkt_matrix[-num_inequality_constraints:,:num_dims+num_equality_constraints], 
+                                                    -slacks / dual_inequality, neg_residual, C_is_diag=True)
+#    affine_step = _schur_complement_solve_symmetric_ul_pd(augmented_second_order_mat, A_equality, np.zeros((num_equality_constraints,num_equality_constraints)), -reduced_residual, A_is_diag=False)
     solver_end_time = datetime.datetime.now()
     solver_times.append(solver_end_time - solver_start_time)
     x_affine_step = affine_step[:num_dims]
@@ -450,7 +651,10 @@ def interior_point_qp(second_order_mat, first_order_vec, A_equality, b_equality,
         
         #affine_step = _schur_complement_solve_symmetric(second_order_mat, A, -y / nu, neg_residual, C_is_diag=True)
         solver_start_time = datetime.datetime.now()
-        affine_step = sl.solve(reduced_kkt_matrix, neg_residual) #linear_conjugate_gradient(reduced_kkt_matrix, neg_residual)
+#        affine_step = sl.solve(reduced_kkt_matrix, neg_residual) #linear_conjugate_gradient(reduced_kkt_matrix, neg_residual)
+        affine_step = _schur_complement_solve_symmetric(reduced_kkt_matrix[:num_dims+num_equality_constraints,:num_dims+num_equality_constraints], 
+                                                        reduced_kkt_matrix[-num_inequality_constraints:,:num_dims+num_equality_constraints], 
+                                                        -slacks / dual_inequality, neg_residual, C_is_diag=True)
         solver_end_time = datetime.datetime.now()
         solver_times.append(solver_end_time - solver_start_time)
 #        print "l_inf norm of affine step residual is", sl.norm(np.dot(reduced_kkt_matrix, affine_step) - neg_residual, ord=float("inf"))
@@ -493,7 +697,10 @@ def interior_point_qp(second_order_mat, first_order_vec, A_equality, b_equality,
         residual_corrected_reduced_kkt = residual_inequality + (residual_corrected_complementary_slackness / dual_inequality)
         neg_corrected_residual = -np.hstack((residual_lagrangian, residual_equality, residual_corrected_reduced_kkt))
         solver_start_time = datetime.datetime.now()
-        step = sl.solve(reduced_kkt_matrix, neg_corrected_residual) #linear_conjugate_gradient(reduced_kkt_matrix, neg_corrected_residual)
+#        step = sl.solve(reduced_kkt_matrix, neg_corrected_residual) #linear_conjugate_gradient(reduced_kkt_matrix, neg_corrected_residual)
+        step = _schur_complement_solve_symmetric(reduced_kkt_matrix[:num_dims+num_equality_constraints,:num_dims+num_equality_constraints], 
+                                                 reduced_kkt_matrix[-num_inequality_constraints:,:num_dims+num_equality_constraints], 
+                                                 -slacks / dual_inequality, neg_corrected_residual, C_is_diag=True)
         solver_end_time = datetime.datetime.now()
         solver_times.append(solver_end_time - solver_start_time)
         #step = _schur_complement_solve_symmetric(second_order_mat, A, -y / nu, neg_corrected_residual, C_is_diag=True)
@@ -563,49 +770,79 @@ def interior_point_qp(second_order_mat, first_order_vec, A_equality, b_equality,
         print "failed to find solution, returning None"
         return None
 
-def _schur_complement_solve_symmetric(A, B, C, d, C_is_diag=False):
+def _schur_complement_solve_symmetric_ul_pd(A, B, C, d, A_is_diag=False, A_inv = None):
+    """Solves problem:
+        [ A B'] z = d
+        [ B C ]
+        for z. Assumes that A is a symmetric positive definite, matrix"""
+    
+    if A_inv == None:
+        A_inv = sl.inv(A)
+        
+    A_dim = A.shape[0]
+    z_a= d[:A_dim]
+    
+    if A_is_diag:
+        z_b = d[A_dim:] - np.dot(B, z_a / A)
+    else:
+        z_b = d[A_dim:] - np.dot(B, np.dot(A_inv, z_a)) #sl.solve(A, z_a))
+        
+    if A_is_diag:
+        schur_comp_mat = C - np.dot(B, B.T / A[:,np.newaxis])
+    else:
+        schur_comp_mat = C - np.dot(np.dot(B, A_inv), B.T)
+        
+    z_b = sl.solve(schur_comp_mat, z_b)
+    
+    if A_is_diag:
+        z_a /= A
+    else:
+        z_a = np.dot(A_inv, z_a) #sl.solve(A, z_a, sym_pos=True, overwrite_b=True)
+    #z_b finished, compute z_a
+    
+    if A_is_diag: #BUGS HERE
+        z_a -= np.dot(B.T, z_b) / A
+    else:
+        z_a -= np.dot(A_inv, np.dot(B.T, z_b)) #sl.solve(A, np.dot(B.T, z_b))
+        
+    return np.reshape(np.hstack((z_a, z_b)), d.shape)
+
+def _schur_complement_solve_symmetric(A, B, C, d, C_is_diag=False, C_inv = None):
     """Solves problem:
         [ A B'] z = d
         [ B C ]
         for z. Assumes that C is a symmetric positive definite, matrix"""
     A_dim = A.shape[0]
-    B_rows = B.shape[0]
-    matrix_dim = A_dim + B_rows
-    upper_triangular_schur_matrix = np.eye(matrix_dim)
-    if C_is_diag:
-        upper_triangular_schur_matrix[:A_dim, -B_rows:] = (B * C[:, np.newaxis]).T
-    else:
-        upper_triangular_schur_matrix[:A_dim, -B_rows:] = np.dot(B.T, C)
-    
-    z = sl.solve_triangular(upper_triangular_schur_matrix, d, trans=0, lower=False)
-    z_a = z[:A_dim]
-    z_b = z[-B_rows:]
+    z_b = d[A_dim:]
+    if C_inv == None:
+        C_inv = sl.inv(C)
     
     if C_is_diag:
-        z_b = z_b / C
+        z_a = d[:A_dim] - np.dot(B.T, z_b / C)
     else:
-        z_b = sl.solve(C, z_b, sym_pos=True, overwrite_b=True)
+#        z_a = d[:A_dim] - np.dot(B.T, np.dot(sl.inv(C), z_b))
+        z_a = d[:A_dim] - np.dot(B.T, np.dot(C_inv, z_b))#sl.solve(C, z_b, sym_pos=True))
+    #SOLVED UPPER TRIANGULAR MATRIX, now middle one
     
     if C_is_diag:
         schur_comp_mat = A - np.dot(B.T,B / C[:, np.newaxis])
     else:
-        schur_comp_mat = A - np.dot(np.dot(B.T, sl.inv(C)), B) # A - B' C^{-1} B
+        schur_comp_mat = A - np.dot(np.dot(B.T, C_inv), B) # A - B' C^{-1} B
     
-    try:    
-        z_a = sl.solve(schur_comp_mat , z_a, sym_pos=True, overwrite_b=True)
-    except np.linalg.linalg.LinAlgError:
-        print "failed with scipy solve, trying conjugate gradient"
-        z_a = linear_conjugate_gradient(schur_comp_mat, z_a, verbose=False)
-    lower_triangular_schur_matrix = np.eye(matrix_dim)
-    z = np.hstack((z_a, z_b))
+    z_a = sl.solve(schur_comp_mat , z_a)#, sym_pos=True, overwrite_b=True)
+    
     if C_is_diag:
-        lower_triangular_schur_matrix[-B_rows:, :A_dim] = B / C[:, np.newaxis]
+        z_b /= C
     else:
-        lower_triangular_schur_matrix[-B_rows:, :A_dim] = np.dot(sl.inv(C), B)
+        z_b = np.dot(C_inv, z_b) #sl.solve(C, z_b, sym_pos=True, overwrite_b=True)
+        
+    #SOLVED MIDDLE MATRIX, now lower triangular, z_a already finished
+    if C_is_diag:
+        z_b -= np.dot(B, z_a) / C
+    else:
+        z_b -= np.dot(C_inv, np.dot(B, z_a), sym_pos=True) #sl.solve(C, np.dot(B, z_a), sym_pos=True) 
     
-    z = sl.solve_triangular(lower_triangular_schur_matrix, z, lower=True, overwrite_b=True)
-    
-    return z
+    return np.reshape(np.hstack((z_a, z_b)), d.shape)
 
 def linear_conjugate_gradient(second_order_mat, first_order_vec, num_epochs = None, damping_factor = 0.0, #seems to be correct, compare with conjugate_gradient.py
                               verbose = False, x_0 = None, residual_norm_condition=1E-5, function_decrease_condition=1E-7,
@@ -687,4 +924,5 @@ if __name__ == '__main__':
     qp_obj = QP_object()
     qp_obj.read_qps_file('qps_files/CVXQP3_M.SIF.txt')
     G,c,A_inequality, b_inequality, A_equality, b_equality = qp_obj.qp_obj_to_standard_form_with_equality_constraints()
-    x = interior_point_qp(G, c, A_equality, b_equality, A_inequality, b_inequality, seed=1)
+    x = interior_point_qp_augmented_lagrangian(G, c, A_equality, b_equality, A_inequality, b_inequality, seed=0, tol=1E-5)
+    
