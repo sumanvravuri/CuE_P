@@ -11,6 +11,7 @@ import datetime
 import re
 import logging
 import sys
+from scipy.linalg import fblas as FB
 
 class QP_object:
     def __init__(self):
@@ -28,7 +29,7 @@ class QP_object:
         self.equality_constraints_vec = None
         
         self.inequality_constraints_mat = None
-        self.inequality_constraints_vec = 0.0
+        self.inequality_constraints_vec = None
         self.inequality_constraints_operator = list()
         
         self.bound_constraints_dict = dict() #col_name -> (bound, operator)
@@ -82,47 +83,80 @@ class QP_object:
 
     def qp_obj_to_standard_form_with_equality_constraints(self):
         
-        A_inequality = None
-        b_inequality = None
+        A_inequality = self.inequality_constraints_mat
+        b_inequality = self.inequality_constraints_vec
         
         A_equality = self.equality_constraints_mat
         b_equality = self.equality_constraints_vec
         
-        
         if self.num_constraints[1] > 0:
-            for idx, row in enumerate(self.inequality_constraints_mat):
-                if self.inequality_constraints_operator[idx] == '>':
-                    if A_inequality == None:
-                        A_inequality = row
-                        b_inequality = self.inequality_constraints_vec[idx]
-                    else:
-                        A_inequality = np.vstack((A_inequality, row))
-                        b_inequality = np.hstack((b_inequality, self.inequality_constraints_vec[idx]))
-                elif self.inequality_constraints_operator[idx] == '<':
-                    if A_inequality == None:
-                        A_inequality = -row
-                        b_inequality = -self.inequality_constraints_vec[idx]
-                    else:
-                        A_inequality = np.vstack((A_inequality, -row))
-                        b_inequality = np.hstack((b_inequality, -self.inequality_constraints_vec[idx]))
+            A_inequality[np.where([ x == '<' for x in self.inequality_constraints_operator])] *= -1
+            b_inequality[np.where([ x == '<' for x in self.inequality_constraints_operator])] *= -1
         
         if self.num_constraints[2] > 0:
-            for bound_col_name in self.bound_constraints_dict:
-                col_idx = self.col_name_to_idx_dict[bound_col_name]
-                for bound, operator in self.bound_constraints_dict[bound_col_name]:
-                    row = np.zeros((self.num_dim,))
-                    if operator == 'LO':
-                        row[col_idx] = 1.0
-                        out_bound = bound
-                    else:
-                        row[col_idx] = -1.0
-                        out_bound = -bound
-                    if A_inequality == None:
-                        A_inequality = row
-                        b_inequality = bound
-                        continue
-                    A_inequality = np.vstack((A_inequality, row))
-                    b_inequality = np.hstack((b_inequality, out_bound))
+            bound_indices = [(self.col_name_to_idx_dict[col_name], (1 - 2*('UP' in bound)) * bound[0])
+                             for col_name in self.bound_constraints_dict for bound in self.bound_constraints_dict[col_name]]
+            bound_indices.sort()
+            A_bounds = np.zeros((len(bound_indices), self.num_dim))
+            A_bounds[(range(len(bound_indices)), [x for x, bound in bound_indices])] = 1.0
+            b_bounds = np.array([bound for x, bound in bound_indices])
+            if A_inequality == None:
+                A_inequality = A_bounds
+                b_inequality = b_bounds
+            else:
+                A_inequality = np.vstack((A_inequality, A_bounds))
+                b_inequality = np.hstack((b_inequality, b_bounds))
+        #THIS IS BETTER IF I HAD A SPARSE SOLVER
+#        if self.num_constraints[2] > 0:
+#            lower_bound_indices = [(self.col_name_to_idx_dict[col_name], bound[0]) for col_name in self.bound_constraints_dict for bound in self.bound_constraints_dict[col_name] if 'LO' in bound]
+#            
+#            if len(lower_bound_indices) > 0:
+#                lower_bound_indices.sort()
+#                A_lower_bound = np.zeros((len(lower_bound_indices), self.num_dim))
+#                A_lower_bound[(range(len(lower_bound_indices)), [x for x, bound in lower_bound_indices])] = 1.0
+#                b_lower_bound = np.array([bound for x, bound in lower_bound_indices])
+#                if A_inequality == None:
+#                    A_inequality = A_lower_bound
+#                    b_inequality = b_lower_bound
+#                else:
+#                    A_inequality = np.vstack((A_inequality, A_lower_bound))
+#                    b_inequality = np.hstack((b_inequality, b_lower_bound))
+#            
+#            upper_bound_indices = [(self.col_name_to_idx_dict[col_name], bound[0]) for col_name in qp_obj.bound_constraints_dict for bound in self.bound_constraints_dict[col_name] if 'UP' in bound]
+#            if len(lower_bound_indices) > 0:
+#                upper_bound_indices.sort()
+#                A_upper_bound = np.zeros((len(upper_bound_indices), self.num_dim))
+#                A_upper_bound[(range(len(upper_bound_indices)), [x for x, bound in upper_bound_indices])] = -1.0
+#                b_upper_bound = np.array([-bound for x, bound in upper_bound_indices])
+#                if A_inequality == None:
+#                    A_inequality = A_upper_bound
+#                    b_inequality = b_upper_bound
+#                else:
+#                    A_inequality = np.vstack((A_inequality, A_upper_bound))
+#                    b_inequality = np.hstack((b_inequality, b_upper_bound))
+
+
+                #NAIVE IMPLEMENTATION
+#        if self.num_constraints[2] > 0:
+#            for bound_col_name in self.bound_constraints_dict:
+#                col_idx = self.col_name_to_idx_dict[bound_col_name]
+#                for bound, operator in self.bound_constraints_dict[bound_col_name]:
+#                    row = np.zeros((self.num_dim,))
+#                    if operator == 'LO':
+#                        row[col_idx] = 1.0
+#                        out_bound = bound
+#                    elif operator == 'UP':
+#                        row[col_idx] = -1.0
+#                        out_bound = -bound
+#                    else:
+#                        print operator, "not understood... should be either 'LO' or 'UP'"
+#                        sys.exit(-1)
+#                    if A_inequality == None:
+#                        A_inequality = row
+#                        b_inequality = bound
+#                        continue
+#                    A_inequality = np.vstack((A_inequality, row))
+#                    b_inequality = np.hstack((b_inequality, out_bound))
                 
         return self.quad_obj_mat, self.lin_obj_vec, A_inequality, b_inequality, A_equality, b_equality
 
@@ -332,14 +366,17 @@ def interior_point_qp_augmented_lagrangian(second_order_mat, first_order_vec, A_
     vu_0 is the dual variable for Ax-y = b condition"""
     start_time = datetime.datetime.now()
     solver_times = list()
+    augmented_mat_creation_times = list()
     np.random.seed(seed)
     num_equality_constraints = len(b_equality)
     num_inequality_constraints = len(b_inequality)
     num_dims = len(first_order_vec)
     #TODO: better initial parameters
     if x_0 == None:
-        x = np.dot(sl.pinv(A_equality), b_equality)
-        norm_residual = np.linalg.norm(np.dot(A_equality, x) - b_equality, ord=2)
+#        x = np.dot(sl.pinv(A_equality), b_equality)
+#        residual = np.dot(A_equality, x) - b_equality
+        x, residual, rank, singular_values = np.linalg.lstsq(A_equality, b_equality)
+        norm_residual = np.linalg.norm(residual, ord=2)
         if norm_residual > tol:
             print "equality constraints are not satisfiable since residual", norm_residual, "is greater than", tol, "tolerance... quitting"
             sys.exit(3)
@@ -372,7 +409,12 @@ def interior_point_qp_augmented_lagrangian(second_order_mat, first_order_vec, A_
     
     #TRY A REDUCED SYSTEM
     reduced_residual = np.hstack((residual_augmented_lagrangian, residual_equality))
-    augmented_second_order_mat = second_order_mat + np.dot(A_inequality.T, A_inequality * (dual_inequality/slacks)[:, np.newaxis])
+    creation_start_time = datetime.datetime.now()
+#    augmented_second_order_mat = second_order_mat + np.dot(A_inequality.T, A_inequality * (dual_inequality/slacks)[:, np.newaxis])
+    A_half = A_inequality * np.sqrt(dual_inequality/slacks)[:, np.newaxis]
+    augmented_second_order_mat = second_order_mat +  FB.dgemm(alpha=1.0, a=A_half.T, b=A_half.T, trans_b=True)
+    creation_end_time = datetime.datetime.now()
+    augmented_mat_creation_times.append(creation_end_time-creation_start_time)
     
     solver_start_time = datetime.datetime.now()
     affine_step = _schur_complement_solve_symmetric_ul_pd(augmented_second_order_mat, A_equality, zero_mat, 
@@ -406,8 +448,14 @@ def interior_point_qp_augmented_lagrangian(second_order_mat, first_order_vec, A_
         residual_inequality = np.dot(A_inequality, x) - b_inequality - slacks
         residual_equality = np.dot(A_equality, x) - b_equality
         residual_complementary_slackness = dual_inequality * slacks
-        augmented_second_order_mat = second_order_mat + np.dot(A_inequality.T, A_inequality * (dual_inequality/slacks)[:, np.newaxis])
+        creation_start_time = datetime.datetime.now()
+#        augmented_second_order_mat = second_order_mat + np.dot(A_inequality.T, A_inequality * (dual_inequality/slacks)[:, np.newaxis])
+        A_half = A_inequality * np.sqrt(dual_inequality/slacks)[:, np.newaxis]
+        augmented_second_order_mat = second_order_mat +  FB.dgemm(alpha=1.0, a=A_half.T, b=A_half.T, trans_b=True)
+        creation_end_time = datetime.datetime.now()
+        augmented_mat_creation_times.append(creation_end_time-creation_start_time)
         inv_augmented_second_order_mat = sl.inv(augmented_second_order_mat)
+        neg_schur_part = FB.dgemm(alpha=1.0, a=np.dot(A_equality, inv_augmented_second_order_mat).T, b=A_equality.T, trans_a=True)
         #TODO: check if tolerance condition is correct
         max_residual = max([np.linalg.norm(residual_lagrangian, ord=float("inf")), np.linalg.norm(residual_inequality, ord=float("inf")), 
                             np.linalg.norm(residual_equality, ord=float("inf")), np.linalg.norm(residual_complementary_slackness, ord=float("inf"))])
@@ -416,13 +464,14 @@ def interior_point_qp_augmented_lagrangian(second_order_mat, first_order_vec, A_
             break
         
         mu = np.sum(residual_complementary_slackness) / num_inequality_constraints
-        residual_augmented_lagrangian = residual_lagrangian + np.dot(A_inequality.T, (residual_complementary_slackness + residual_inequality * dual_inequality)/slacks)
+        
         # update KKT matrix and solve Newton equation for affine step
+        residual_augmented_lagrangian = residual_lagrangian + np.dot(A_inequality.T, (residual_complementary_slackness + residual_inequality * dual_inequality)/slacks)
         reduced_residual = np.hstack((residual_augmented_lagrangian, residual_equality))
         solver_start_time = datetime.datetime.now()
         affine_step = _schur_complement_solve_symmetric_ul_pd(augmented_second_order_mat, A_equality, zero_mat, 
                                                               -reduced_residual, A_is_diag=False, 
-                                                              A_inv=inv_augmented_second_order_mat)
+                                                              B_Ainv_BT = neg_schur_part, A_inv=inv_augmented_second_order_mat)
         solver_end_time = datetime.datetime.now()
         solver_times.append(solver_end_time - solver_start_time)
         x_affine_step = affine_step[:num_dims]
@@ -460,7 +509,7 @@ def interior_point_qp_augmented_lagrangian(second_order_mat, first_order_vec, A_
         solver_start_time = datetime.datetime.now()
         step = _schur_complement_solve_symmetric_ul_pd(augmented_second_order_mat, A_equality, zero_mat, 
                                                        -reduced_corrected_residual, A_is_diag=False,
-                                                       A_inv=inv_augmented_second_order_mat)
+                                                       B_Ainv_BT = neg_schur_part, A_inv=inv_augmented_second_order_mat)
         solver_end_time = datetime.datetime.now()
         solver_times.append(solver_end_time - solver_start_time)
         #TODO: get correct primal/dual step sizes
@@ -505,8 +554,10 @@ def interior_point_qp_augmented_lagrangian(second_order_mat, first_order_vec, A_
     end_time = datetime.datetime.now()
     run_time = end_time - start_time
     print "Solver ran for", run_time
-    print "average run_time for each solve call was", sum(solver_times, datetime.timedelta()) / len(solver_times)
+    print "average run_time for each schur complement solve call was", sum(solver_times, datetime.timedelta()) / len(solver_times)
     print "with a total time", sum(solver_times, datetime.timedelta()) 
+    print "average run_time for each construction of augmented lagrangian was", sum(augmented_mat_creation_times, datetime.timedelta()) / len(augmented_mat_creation_times)
+    print "with a total time", sum(augmented_mat_creation_times, datetime.timedelta())
     if is_solved:
         print "solution found, returning parameters"
         print "primal value is", primal_value
@@ -588,9 +639,9 @@ def interior_point_qp(second_order_mat, first_order_vec, A_equality, b_equality,
     
     solver_start_time = datetime.datetime.now()
 #    affine_step = sl.solve(reduced_kkt_matrix, neg_residual)
-    affine_step = _schur_complement_solve_symmetric(reduced_kkt_matrix[:num_dims+num_equality_constraints,:num_dims+num_equality_constraints], 
-                                                    reduced_kkt_matrix[-num_inequality_constraints:,:num_dims+num_equality_constraints], 
-                                                    -slacks / dual_inequality, neg_residual, C_is_diag=True)
+    affine_step = _schur_complement_solve_symmetric_ld_pd(reduced_kkt_matrix[:num_dims+num_equality_constraints,:num_dims+num_equality_constraints], 
+                                                          reduced_kkt_matrix[-num_inequality_constraints:,:num_dims+num_equality_constraints], 
+                                                          -slacks / dual_inequality, neg_residual, C_is_diag=True)
 #    affine_step = _schur_complement_solve_symmetric_ul_pd(augmented_second_order_mat, A_equality, np.zeros((num_equality_constraints,num_equality_constraints)), -reduced_residual, A_is_diag=False)
     solver_end_time = datetime.datetime.now()
     solver_times.append(solver_end_time - solver_start_time)
@@ -652,9 +703,9 @@ def interior_point_qp(second_order_mat, first_order_vec, A_equality, b_equality,
         #affine_step = _schur_complement_solve_symmetric(second_order_mat, A, -y / nu, neg_residual, C_is_diag=True)
         solver_start_time = datetime.datetime.now()
 #        affine_step = sl.solve(reduced_kkt_matrix, neg_residual) #linear_conjugate_gradient(reduced_kkt_matrix, neg_residual)
-        affine_step = _schur_complement_solve_symmetric(reduced_kkt_matrix[:num_dims+num_equality_constraints,:num_dims+num_equality_constraints], 
-                                                        reduced_kkt_matrix[-num_inequality_constraints:,:num_dims+num_equality_constraints], 
-                                                        -slacks / dual_inequality, neg_residual, C_is_diag=True)
+        affine_step = _schur_complement_solve_symmetric_ld_pd(reduced_kkt_matrix[:num_dims+num_equality_constraints,:num_dims+num_equality_constraints], 
+                                                              reduced_kkt_matrix[-num_inequality_constraints:,:num_dims+num_equality_constraints], 
+                                                              -slacks / dual_inequality, neg_residual, C_is_diag=True)
         solver_end_time = datetime.datetime.now()
         solver_times.append(solver_end_time - solver_start_time)
 #        print "l_inf norm of affine step residual is", sl.norm(np.dot(reduced_kkt_matrix, affine_step) - neg_residual, ord=float("inf"))
@@ -698,9 +749,9 @@ def interior_point_qp(second_order_mat, first_order_vec, A_equality, b_equality,
         neg_corrected_residual = -np.hstack((residual_lagrangian, residual_equality, residual_corrected_reduced_kkt))
         solver_start_time = datetime.datetime.now()
 #        step = sl.solve(reduced_kkt_matrix, neg_corrected_residual) #linear_conjugate_gradient(reduced_kkt_matrix, neg_corrected_residual)
-        step = _schur_complement_solve_symmetric(reduced_kkt_matrix[:num_dims+num_equality_constraints,:num_dims+num_equality_constraints], 
-                                                 reduced_kkt_matrix[-num_inequality_constraints:,:num_dims+num_equality_constraints], 
-                                                 -slacks / dual_inequality, neg_corrected_residual, C_is_diag=True)
+        step = _schur_complement_solve_symmetric_ld_pd(reduced_kkt_matrix[:num_dims+num_equality_constraints,:num_dims+num_equality_constraints], 
+                                                       reduced_kkt_matrix[-num_inequality_constraints:,:num_dims+num_equality_constraints], 
+                                                       -slacks / dual_inequality, neg_corrected_residual, C_is_diag=True)
         solver_end_time = datetime.datetime.now()
         solver_times.append(solver_end_time - solver_start_time)
         #step = _schur_complement_solve_symmetric(second_order_mat, A, -y / nu, neg_corrected_residual, C_is_diag=True)
@@ -770,15 +821,21 @@ def interior_point_qp(second_order_mat, first_order_vec, A_equality, b_equality,
         print "failed to find solution, returning None"
         return None
 
-def _schur_complement_solve_symmetric_ul_pd(A, B, C, d, A_is_diag=False, A_inv = None):
+def _schur_complement_solve_symmetric_ul_pd(A, B, C, d, A_is_diag=False, A_inv = None, B_Ainv_BT = None):
     """Solves problem:
         [ A B'] z = d
         [ B C ]
         for z. Assumes that A is a symmetric positive definite, matrix"""
     
-    if A_inv == None:
-        A_inv = sl.inv(A)
-        
+    if not A_is_diag:
+        if A_inv == None:
+            A_inv = sl.inv(A)
+        if B_Ainv_BT == None:
+            B_Ainv_BT = FB.dgemm(alpha=1.0, a=np.dot(B, A_inv).T, b=B.T, trans_a=True)
+    else:
+        if B_Ainv_BT == None:
+            B_Ainv_BT = FB.dgemm(alpha=1.0, a=(B/A[:,np.newaxis]).T, b=B.T, trans_a=True)
+
     A_dim = A.shape[0]
     z_a= d[:A_dim]
     
@@ -786,11 +843,14 @@ def _schur_complement_solve_symmetric_ul_pd(A, B, C, d, A_is_diag=False, A_inv =
         z_b = d[A_dim:] - np.dot(B, z_a / A)
     else:
         z_b = d[A_dim:] - np.dot(B, np.dot(A_inv, z_a)) #sl.solve(A, z_a))
+    
+    schur_comp_mat = C - B_Ainv_BT
         
-    if A_is_diag:
-        schur_comp_mat = C - np.dot(B, B.T / A[:,np.newaxis])
-    else:
-        schur_comp_mat = C - np.dot(np.dot(B, A_inv), B.T)
+#    if A_is_diag:
+#        schur_comp_mat = C - np.dot(B, B.T / A[:,np.newaxis])
+#    else:
+##        schur_comp_mat = C - np.dot(np.dot(B,A_inv), B.T)
+#        schur_comp_mat = C - B_Ainv_BT
         
     z_b = sl.solve(schur_comp_mat, z_b)
     
@@ -800,14 +860,14 @@ def _schur_complement_solve_symmetric_ul_pd(A, B, C, d, A_is_diag=False, A_inv =
         z_a = np.dot(A_inv, z_a) #sl.solve(A, z_a, sym_pos=True, overwrite_b=True)
     #z_b finished, compute z_a
     
-    if A_is_diag: #BUGS HERE
+    if A_is_diag: 
         z_a -= np.dot(B.T, z_b) / A
     else:
         z_a -= np.dot(A_inv, np.dot(B.T, z_b)) #sl.solve(A, np.dot(B.T, z_b))
         
     return np.reshape(np.hstack((z_a, z_b)), d.shape)
 
-def _schur_complement_solve_symmetric(A, B, C, d, C_is_diag=False, C_inv = None):
+def _schur_complement_solve_symmetric_ld_pd(A, B, C, d, C_is_diag=False, C_inv = None):
     """Solves problem:
         [ A B'] z = d
         [ B C ]
@@ -922,7 +982,9 @@ def linear_conjugate_gradient(second_order_mat, first_order_vec, num_epochs = No
 if __name__ == '__main__':
     print "testing interior point algorithm"
     qp_obj = QP_object()
-    qp_obj.read_qps_file('qps_files/CVXQP3_M.SIF.txt')
+    qp_obj.read_qps_file('qps_files/CVXQP2_M.SIF.txt')
+    print "converting to standard form"
     G,c,A_inequality, b_inequality, A_equality, b_equality = qp_obj.qp_obj_to_standard_form_with_equality_constraints()
-    x = interior_point_qp_augmented_lagrangian(G, c, A_equality, b_equality, A_inequality, b_inequality, seed=0, tol=1E-5)
+    print "running qp"
+    x = interior_point_qp_augmented_lagrangian(G, c, A_equality, b_equality, A_inequality, b_inequality, seed=0, tol=1E-5, max_iterations=500)
     
