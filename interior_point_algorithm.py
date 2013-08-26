@@ -358,7 +358,255 @@ def _calculate_primal_dual_step_size(primal_step_size, dual_step_size,
         return primal_step_size, dual_step_size
     else:
         return min_step_size, min_step_size
+
+def interior_point_qp_svm(data, labels, C, xi_0, w_0, bias_0, dual_inequality_0):
+    """
+    minimizes function 1/2 w'w + C 1'xi 
+    s.t. xi >= 0
+    label_i(data_i x + bias) >= 1 - xi_i            i=1,...,n_data
+    """
+    pass
+
+
+def interior_point_qp_inequality_multi_corrector(second_order_mat, first_order_vec, A_inequality, b_inequality, 
+                                                 tol=1E-8, max_iterations=100, x_0=None, slack_0=None, dual_inequality_0=None, 
+                                                 dual_equality_0=None, tau=None, seed=0, verbose = False, use_unequal_primal_dual_steps=False,
+                                                 beta_min=0.1, beta_max=10.0, gamma=0.1, delta=0.1, max_num_correctors=5):
+    """minimizes function 1/2 x'(second_order_mat)x + (first_order_vec)'x subject to (A_inequality)x >= b, (A_equality)x = b
+    using an interior point algorithm
+    vu_0 is the dual variable for Ax-y = b condition"""
+    start_time = datetime.datetime.now()
+    solver_times = list()
+    np.random.seed(seed)
+    num_inequality_constraints = len(b_inequality)
+    num_dims = len(first_order_vec)
+    #TODO: better initial parameters
+    if x_0 == None:
+        x, residual, rank, singular_values = np.linalg.lstsq(A_equality, b_equality)
+        norm_residual = np.linalg.norm(residual, ord=2)
+        if norm_residual > tol:
+            print "equality constraints are not satisfiable since residual", norm_residual, "is greater than", tol, "tolerance... quitting"
+            sys.exit(3)
+    else:
+        x = x_0
+    if slack_0 == None:
+        slacks = np.random.rand(num_inequality_constraints) + 1.
+    else:
+        slacks = slack_0
+    if dual_inequality_0 == None:
+        dual_inequality = np.random.rand(num_inequality_constraints) + 1.
+    else:
+        dual_inequality = dual_inequality_0
+    if tau == None:
+        if max_iterations <= 5:
+            tau = np.ones((max_iterations,)) * 0.95
+        else:
+            tau = np.hstack((np.ones((5,)) * 0.5, np.ones(max_iterations-5,) * 0.95))
+    residual_lagrangian, residual_inequality, residual_complementary_slackness = _calculate_inequality_residuals(x, second_order_mat, first_order_vec, A_inequality, slacks, dual_inequality)
     
+    residual_augmented_inequality = residual_inequality + slacks
+    
+    #TRY A REDUCED SYSTEM
+    reduced_residual = np.hstack((residual_lagrangian, residual_augmented_inequality))
+    # KKT_mat = [G A_I']
+    #           [A_I -L^{-1}S]
+    solver_start_time = datetime.datetime.now()
+    affine_step = _schur_complement_solve_symmetric_lr_pd(second_order_mat, A_inequality, -slacks / dual_inequality, 
+                                                          -reduced_residual, C_is_diag=True)
+    solver_end_time = datetime.datetime.now()
+    solver_times.append(solver_end_time - solver_start_time)
+    x_affine_step = affine_step[:num_dims]
+    dual_inequality_affine_step = -affine_step[num_dims:]
+    slacks_affine_step = -(slacks + slacks/dual_inequality * dual_inequality_affine_step)
+    
+    x += x_affine_step
+    slacks += slacks_affine_step
+    dual_inequality += dual_inequality_affine_step
+    violation = max([np.max(-dual_inequality), np.max(-slacks), 0.0])
+    shift = 1000 + 2 * violation
+    slacks += shift
+    dual_inequality += shift
+    
+    is_solved = False
+    print "----------------------------------------------------------------------------------------------------------------------------------------"
+    print "|iter\t|#corr.\t|lagrange res.\t|ineq. res.\t|CompSlack res.\t|primal value \t\t|mu \t\t|sigma \t\t|"
+    for iteration in range(max_iterations):
+        print "----------------------------------------------------------------------------------------------------------------------------------------"
+
+        #check if KKT conditions satisfied
+        residual_lagrangian, residual_inequality, residual_complementary_slackness = _calculate_inequality_residuals(x, second_order_mat, first_order_vec, A_inequality, slacks, dual_inequality)
+        max_residual = max([np.linalg.norm(residual_lagrangian, ord=float("inf")), np.linalg.norm(residual_inequality, ord=float("inf")), 
+                            np.linalg.norm(residual_complementary_slackness, ord=float("inf"))])
+        if max_residual < tol:
+            is_solved = True
+            break
+        
+        #RUN PREDICTOR STEP
+        schur_part = second_order_mat + FB.dgemm(alpha=1.0, a=(A_inequality * (dual_inequality / slacks)[:,np.newaxis]).T, b=A_inequality.T, trans_b=True)
+        try:
+            schur_part_chol_factor = sl.cho_factor(schur_part)
+        except np.linalg.linalg.LinAlgError:
+            schur_part_chol_factor = None
+        #TODO: check if tolerance condition is correct
+        mu = np.sum(residual_complementary_slackness) / num_inequality_constraints
+        
+        # update KKT matrix and solve Newton equation for affine step
+        residual_augmented_inequality = residual_inequality + slacks
+        reduced_residual = np.hstack((residual_lagrangian, residual_augmented_inequality))
+        solver_start_time = datetime.datetime.now()
+        affine_step = _schur_complement_solve_symmetric_lr_pd(second_order_mat, A_inequality, -slacks / dual_inequality, 
+                                                              -reduced_residual, C_is_diag=True, 
+                                                              schur_comp_chol_factor = schur_part_chol_factor)
+        solver_end_time = datetime.datetime.now()
+        solver_times.append(solver_end_time - solver_start_time)
+        x_affine_step = affine_step[:num_dims]
+        dual_inequality_affine_step = -affine_step[num_dims:]
+        slacks_affine_step = -(slacks + slacks/dual_inequality * dual_inequality_affine_step)
+        
+        #get primal and dual step sizes
+        
+        dual_inequality_affine_step_size = _max_val_pos_step_size(dual_inequality_affine_step, dual_inequality)
+        slacks_affine_step_size = _max_val_pos_step_size(slacks_affine_step, slacks)
+        affine_step_size = min(dual_inequality_affine_step_size, slacks_affine_step_size)
+        
+        slacks_affine = slacks + affine_step_size * slacks_affine_step
+        dual_inequality_affine = dual_inequality + affine_step_size * dual_inequality_affine_step
+        mu_affine = np.dot(slacks_affine, dual_inequality_affine) / num_inequality_constraints
+        sigma = (mu_affine / mu) ** 3
+        #NOT sure if this is the way to handle the problem
+        if sigma > 1.0:
+            sigma = 1.0
+        if verbose: 
+            print "sigma is", sigma
+            print "mu is", mu
+            print "sigma * mu is", sigma * mu
+            
+        #RUN FIRST-ORDER PREDICTOR/CORRECTOR STEP
+        residual_corrected_complementary_slackness = residual_complementary_slackness + slacks_affine_step * dual_inequality_affine_step - sigma * mu
+        residual_corrected_inequality = residual_inequality + residual_corrected_complementary_slackness / dual_inequality
+        reduced_corrected_residual = np.hstack((residual_lagrangian, residual_corrected_inequality))
+        solver_start_time = datetime.datetime.now()
+        step = _schur_complement_solve_symmetric_lr_pd(second_order_mat, A_inequality, -slacks / dual_inequality, 
+                                                              -reduced_corrected_residual, C_is_diag=True, 
+                                                              schur_comp_chol_factor = schur_part_chol_factor)
+        solver_end_time = datetime.datetime.now()
+        solver_times.append(solver_end_time - solver_start_time)
+        #TODO: get correct primal/dual step sizes
+        x_step = step[:num_dims]
+        dual_inequality_step = -step[num_dims:]
+        dual_inequality_step = -(residual_corrected_complementary_slackness / dual_inequality + residual_inequality + np.dot(A_inequality, x_step)) * (dual_inequality / slacks)
+        slacks_step = -(residual_corrected_complementary_slackness + slacks * dual_inequality_step) / dual_inequality
+        
+        dual_inequality_step_size = _max_val_pos_step_size(dual_inequality_step, dual_inequality, scaling_parameter=tau[iteration])
+        slacks_step_size = _max_val_pos_step_size(slacks_step, slacks, scaling_parameter=tau[iteration])
+        
+        predictor_corrector_step_size = min(slacks_step_size, dual_inequality_step_size)
+        #RUN HIGHER-ORDER PREDICTOR/CORRECTOR STEPS
+        num_correctors = 0
+        for corrector_iter in range(max_num_correctors):
+#            higher_order_complementary_slackness = (slacks + slacks_step_size * slacks_step) * (dual_inequality + dual_inequality_step_size * dual_inequality_step)
+#            StepFactor0 = 0.08 
+#            StepFactor1 = 1.08
+            AcceptTol = 0.005
+            target_step_size = predictor_corrector_step_size #min(StepFactor1 * predictor_corrector_step_size + StepFactor0, 1.0);
+#            print (np.min(residual_complementary_slackness), np.max(residual_complementary_slackness))
+#            print (predictor_corrector_step_size, target_step_size)
+            higher_order_complementary_slackness = (slacks + target_step_size * slacks_step) * (dual_inequality + target_step_size * dual_inequality_step)
+            min_val = beta_min * sigma * mu
+            max_val = beta_max * sigma * mu
+#            print (min_val, max_val)
+#            print (np.min(higher_order_complementary_slackness), np.max(higher_order_complementary_slackness))
+            higher_order_corrector = _gondzio_projection(higher_order_complementary_slackness, min_val, max_val)
+#            print (np.min(higher_order_corrector), np.max(higher_order_corrector))
+            
+            residual_higher_order_complementary_slackness =  higher_order_corrector
+            residual_higher_order_inequality = residual_inequality + residual_higher_order_complementary_slackness / dual_inequality
+            reduced_higher_order_residual = np.hstack((residual_lagrangian, residual_higher_order_inequality))
+            solver_start_time = datetime.datetime.now()
+            higher_order_step = _schur_complement_solve_symmetric_lr_pd(second_order_mat, A_inequality, -slacks / dual_inequality, 
+                                                                        reduced_higher_order_residual, C_is_diag=True, 
+                                                                        schur_comp_chol_factor = schur_part_chol_factor)
+            solver_end_time = datetime.datetime.now()
+            solver_times.append(solver_end_time - solver_start_time)
+            #TODO: get correct primal/dual step sizes
+            x_higher_order_step = higher_order_step[:num_dims]
+            dual_inequality_higher_order_step = -higher_order_step[num_dims:]
+            slacks_higher_order_step = -(residual_higher_order_complementary_slackness + slacks * dual_inequality_higher_order_step) / dual_inequality
+            
+            x_higher_order_step += x_step
+            dual_inequality_higher_order_step += dual_inequality_step
+            slacks_higher_order_step += slacks_step
+            
+            dual_inequality_higher_order_step_size = _max_val_pos_step_size(dual_inequality_step + dual_inequality_higher_order_step, dual_inequality)
+            slacks_higher_order_step_size = _max_val_pos_step_size(slacks_step + slacks_higher_order_step, slacks)
+            higher_order_step_size = min(dual_inequality_higher_order_step_size, slacks_higher_order_step_size)
+#            print (predictor_corrector_step_size, higher_order_step_size)
+             
+            if higher_order_step_size >= (1.0+AcceptTol) * predictor_corrector_step_size:
+#            dual_inequality_higher_order_step_size > dual_inequality_step_size + gamma * delta and slacks_higher_order_step_size > slacks_step_size + gamma * delta:
+                x_step += x_higher_order_step
+                dual_inequality_step += dual_inequality_higher_order_step
+                slacks_step += slacks_higher_order_step
+                slacks_step_size = slacks_higher_order_step_size
+                dual_inequality_step_size = dual_inequality_higher_order_step_size
+                predictor_corrector_step_size = min(slacks_step_size, dual_inequality_step_size)
+#                residual_corrected_complementary_slackness = residual_higher_order_complementary_slackness
+                num_correctors += 1
+                if higher_order_step_size == 1.0:
+                    break
+                continue
+            else:
+#                print "Used", corrector_iter, "correctors"
+                break
+        
+#        dual_inequality_step_size = _max_val_pos_step_size(dual_inequality_step, dual_inequality, scaling_parameter=tau[iteration])
+#        slacks_step_size = _max_val_pos_step_size(slacks_step, slacks, scaling_parameter=tau[iteration])
+        slacks_step_size, dual_inequality_step_size = _calculate_mehrotra_step_sizes(slacks, slacks_step, dual_inequality, dual_inequality_step)
+        if verbose:
+            print "dual_inequality_step_size is", dual_inequality_step_size
+            print "slacks_step_size is", slacks_step_size
+        
+        primal_step_size = min(slacks_step_size, dual_inequality_step_size)
+        dual_step_size = primal_step_size
+#        primal_step_size, dual_step_size = _calculate_primal_dual_step_size(slacks_step_size, dual_inequality_step_size, 
+#                                                                           residual_lagrangian, residual_inequality, 
+#                                                                           residual_equality, residual_complementary_slackness,
+#                                                                           x_step, slacks_step, dual_inequality_step, 
+#                                                                           slacks, dual_inequality, second_order_mat, 
+#                                                                           use_min=(use_unequal_primal_dual_steps == False))
+        
+        if verbose:
+            print "(primal, dual) step size is", (primal_step_size, dual_step_size)
+        
+        x += x_step * primal_step_size
+        slacks += slacks_step * primal_step_size
+        dual_inequality += dual_inequality_step * dual_step_size
+        primal_value = 0.5 * np.dot(np.dot(second_order_mat,x),x) + np.dot(first_order_vec, x)
+        print "|%d\t|%d\t|%.7f\t|%.7f\t|%.7f\t|%.7f\t|%.7f\t|%.7f\t|" % (iteration, num_correctors, np.linalg.norm(residual_lagrangian, ord=float("inf")),
+                                                                         np.linalg.norm(residual_inequality, ord=float("inf")),
+                                                                         np.linalg.norm(residual_complementary_slackness, ord=float("inf")), primal_value,
+                                                                         mu, sigma)
+    end_time = datetime.datetime.now()
+    run_time = end_time - start_time
+    print "Solver ran for", run_time
+    print "average run_time for each schur complement solve call was", sum(solver_times, datetime.timedelta()) / len(solver_times)
+    print "with a total time", sum(solver_times, datetime.timedelta()) 
+    if is_solved:
+        print "solution found, returning parameters"
+        print "primal value is", primal_value
+        return x
+    else:
+        print "failed to find solution, returning None"
+        return None
+
+
+
+
+
+
+
+
+
 def interior_point_qp_augmented_lagrangian_multi_corrector(second_order_mat, first_order_vec, A_equality, b_equality, A_inequality, b_inequality, 
                                                            tol=1E-8, max_iterations=100, x_0=None, slack_0=None, dual_inequality_0=None, 
                                                            dual_equality_0=None, tau=None, seed=0, verbose = False, use_unequal_primal_dual_steps=False,
@@ -519,10 +767,10 @@ def interior_point_qp_augmented_lagrangian_multi_corrector(second_order_mat, fir
         num_correctors = 0
         for corrector_iter in range(max_num_correctors):
 #            higher_order_complementary_slackness = (slacks + slacks_step_size * slacks_step) * (dual_inequality + dual_inequality_step_size * dual_inequality_step)
-            StepFactor0 = 0.08 
-            StepFactor1 = 1.08
+#            StepFactor0 = 0.08 
+#            StepFactor1 = 1.08
             AcceptTol = 0.005
-            target_step_size = min(StepFactor1 * predictor_corrector_step_size + StepFactor0, 1.0);
+            target_step_size = predictor_corrector_step_size #min(StepFactor1 * predictor_corrector_step_size + StepFactor0, 1.0);
 #            print (np.min(residual_complementary_slackness), np.max(residual_complementary_slackness))
 #            print (predictor_corrector_step_size, target_step_size)
             higher_order_complementary_slackness = (slacks + target_step_size * slacks_step) * (dual_inequality + target_step_size * dual_inequality_step)
@@ -655,6 +903,12 @@ def _calculate_mehrotra_step_sizes(slacks, slacks_step, dual_inequality, dual_in
     
     return slacks_step_size, dual_inequality_step_size
 
+def _calculate_inequality_residuals(x, second_order_mat, first_order_vec, A_inequality, slacks, dual_inequality):
+    residual_lagrangian = np.dot(second_order_mat, x) + first_order_vec - np.dot(A_inequality.T, dual_inequality)
+    residual_inequality = np.dot(A_inequality, x) - b_inequality - slacks
+    residual_complementary_slackness = dual_inequality * slacks
+    return residual_lagrangian, residual_inequality, residual_complementary_slackness
+
 def _calculate_residuals(x, second_order_mat, first_order_vec, A_inequality, A_equality, slacks, dual_inequality, dual_equality):
     residual_lagrangian = np.dot(second_order_mat, x) + first_order_vec - np.dot(A_equality.T, dual_equality) - np.dot(A_inequality.T, dual_inequality)
     residual_inequality = np.dot(A_inequality, x) - b_inequality - slacks
@@ -742,15 +996,23 @@ def _schur_complement_solve_symmetric_ul_pd(A, B, C, d, A_is_diag=False, A_inv =
         
     return np.reshape(np.hstack((z_a, z_b)), d.shape)
 
-def _schur_complement_solve_symmetric_ld_pd(A, B, C, d, C_is_diag=False, C_inv = None):
+def _schur_complement_solve_symmetric_lr_pd(A, B, C, d, C_is_diag=False, C_inv = None, B_Cinv_BT = None, 
+                                            schur_comp_chol_factor = None, neg_schur_comp_chol_factor = None):
     """Solves problem:
-        [ A B'] z = d
-        [ B C ]
+        [ A B'] [z_a] = d
+        [ B C ] [z_b]
         for z. Assumes that C is a symmetric positive definite, matrix"""
+    if not C_is_diag:
+        if C_inv == None:
+            C_inv = sl.inv(A)
+        if B_Cinv_BT == None and schur_comp_chol_factor == None and neg_schur_comp_chol_factor == None:
+            B_Cinv_BT = FB.dgemm(alpha=1.0, a=np.dot(B, C_inv).T, b=B.T, trans_b=True)
+    else:
+        if B_Cinv_BT == None and schur_comp_chol_factor == None and neg_schur_comp_chol_factor == None:
+            B_Cinv_BT = FB.dgemm(alpha=1.0, a=( B / C[:,np.newaxis]).T, b=B.T, trans_b=True)
+            
     A_dim = A.shape[0]
     z_b = d[A_dim:]
-    if C_inv == None:
-        C_inv = sl.inv(C)
     
     if C_is_diag:
         z_a = d[:A_dim] - np.dot(B.T, z_b / C)
@@ -759,12 +1021,18 @@ def _schur_complement_solve_symmetric_ld_pd(A, B, C, d, C_is_diag=False, C_inv =
         z_a = d[:A_dim] - np.dot(B.T, np.dot(C_inv, z_b))#sl.solve(C, z_b, sym_pos=True))
     #SOLVED UPPER TRIANGULAR MATRIX, now middle one
     
-    if C_is_diag:
-        schur_comp_mat = A - np.dot(B.T,B / C[:, np.newaxis])
+    if schur_comp_chol_factor != None:
+        z_a = sl.cho_solve(schur_comp_chol_factor, z_a)
+    elif neg_schur_comp_chol_factor != None:
+        z_a = -sl.cho_solve(neg_schur_comp_chol_factor, z_a)
     else:
-        schur_comp_mat = A - np.dot(np.dot(B.T, C_inv), B) # A - B' C^{-1} B
-    
-    z_a = sl.solve(schur_comp_mat , z_a)#, sym_pos=True, overwrite_b=True)
+        schur_comp_mat = A - B_Cinv_BT    
+        z_a = sl.solve(schur_comp_mat, z_a)
+#    if C_is_diag:
+#        schur_comp_mat = A - np.dot(B.T,B / C[:, np.newaxis])
+#    else:
+#        schur_comp_mat = A - np.dot(np.dot(B.T, C_inv), B) # A - B' C^{-1} B
+#    z_a = sl.solve(schur_comp_mat , z_a)#, sym_pos=True, overwrite_b=True)
     
     if C_is_diag:
         z_b /= C
@@ -779,31 +1047,51 @@ def _schur_complement_solve_symmetric_ld_pd(A, B, C, d, C_is_diag=False, C_inv =
     
     return np.reshape(np.hstack((z_a, z_b)), d.shape)
 
-def linear_conjugate_gradient(second_order_mat, first_order_vec, num_epochs = None, damping_factor = 0.0, #seems to be correct, compare with conjugate_gradient.py
-                              verbose = False, x_0 = None, residual_norm_condition=1E-5, function_decrease_condition=1E-7,
-                              preconditioner = None):
+def _linear_conjugate_gradient(A, B, C, D, residual):
+    """
+    [ A B ]
+    [ C D ] 
+    """
+    pass
+
+def projected_conjugate_gradient(A, B, first_order_vec, num_epochs = None, damping_factor = 0.0, #seems to be correct, compare with conjugate_gradient.py
+                                 verbose = False, x_a_0 = None, x_b_0 = None, residual_norm_condition=1E-5, 
+                                 function_decrease_condition=1E-7):
     """minimizes function f(x) = -b'x + 1/2 * x'(G + d)x using linear conjugate gradient
     where d is the damping factor
-    G is the second order matrix
+    G = [A B']
+        [B 0]
     b is a first order vector"""
-    n_dim = second_order_mat.shape[1]
-    if verbose:
-        print "preconditioner is", preconditioner
+    n_dim = A.shape[0]
+    n_constraints = B.shape[0]
+    
     if num_epochs == None:
-        num_epochs = n_dim
-    if x_0 == None:
-        x_0 = np.random.randn(n_dim, 1)
+        num_epochs = n_dim + n_constraints
+    if x_a_0 == None:
+        x_a_0 = np.random.randn(n_dim, 1)
+    if x_b_0 == None:
+        x_b_0 = np.random.randn(n_constraints, 1) 
     if damping_factor < 0.0:
         print "WARNING, damping_factor", damping_factor, "should be >= 0.0"
     if len(first_order_vec.shape) == 1:
         first_order_vec = np.reshape(first_order_vec, (first_order_vec.size, 1))
-        
-    x = x_0
-    Gx = np.dot(second_order_mat, x)
+     
+    second_order_mat = np.zeros((num_epochs, num_epochs))
+    second_order_mat[:n_dim, :n_dim] = A
+    second_order_mat[n_dim:, :n_dim] = B
+    second_order_mat[:n_dim, n_dim:] = B.T
+    
+    projection_mat = np.zeros((num_epochs, num_epochs))
+    projection_mat[:n_dim, :n_dim] = np.diag(np.diag(A))
+    projection_mat[n_dim:, :n_dim] = B
+    projection_mat[:n_dim, n_dim:] = B.T
+    x = np.vstack((x_a_0, x_b_0))
+    Gx = np.dot(A, x)
     if damping_factor != 0.0:
         Gx += x * damping_factor
     residual = Gx - first_order_vec
     current_function_val = 0.5 * np.vdot(x, residual - first_order_vec)
+    #### Projection code here
     
     if preconditioner != None:
         preconditioned_residual = residual / preconditioner
@@ -853,6 +1141,21 @@ def linear_conjugate_gradient(second_order_mat, first_order_vec, num_epochs = No
         residual_dot = new_residual_dot
     return np.reshape(x, (x.size,))
 
+def ooqp_initialize_inequality(G, c, A_inequality, b_inequality):
+    data_vec = np.zeros(4)
+    data_vec[0] = np.max(np.abs(G))
+    data_vec[1] = np.max(np.abs(c))
+    data_vec[2] = np.max(np.abs(A_inequality))
+    data_vec[3] = np.max(np.abs(b_inequality))
+    
+    sqrt_data_norm = np.sqrt(sl.norm(data_vec,ord=float("inf")))
+    
+    x_0 = np.zeros(len(c))
+    slacks_0 = sqrt_data_norm * np.ones(len(b_inequality))
+    dual_inequality_0 = sqrt_data_norm * np.ones(len(b_inequality)) 
+    
+    return x_0, slacks_0, dual_inequality_0
+
 def ooqp_initialize(G, c, A_equality, b_equality, A_inequality, b_inequality):
     data_vec = np.zeros(6)
     data_vec[0] = np.max(np.abs(G))
@@ -874,13 +1177,20 @@ def ooqp_initialize(G, c, A_equality, b_equality, A_inequality, b_inequality):
 if __name__ == '__main__':
     print "testing interior point algorithm"
     qp_obj = QP_object()
-    qp_obj.read_qps_file('qps_files/CVXQP2_M.SIF.txt')
+    qp_obj.read_qps_file('qps_files/CVXQP3_M.SIF.txt')
     print "converting to standard form"
     G,c,A_inequality, b_inequality, A_equality, b_equality = qp_obj.qp_obj_to_standard_form_with_equality_constraints()
     x_0, slack_0, dual_equality_0, dual_inequality_0 = ooqp_initialize(G, c, A_equality, b_equality, A_inequality, b_inequality)
     print "running qp"
 #    x = interior_point_qp_augmented_lagrangian(G, c, A_equality, b_equality, A_inequality, b_inequality, seed=0, tol=1E-5, max_iterations=150,
-    x = interior_point_qp_augmented_lagrangian_multi_corrector(G, c, A_equality, b_equality, A_inequality, b_inequality, 
-                                                               seed=1, tol=1E-5, max_iterations=150, max_num_correctors=3,
-                                                               x_0=x_0, slack_0=slack_0, dual_inequality_0=dual_inequality_0, 
-                                                               dual_equality_0=dual_equality_0)
+#    x = interior_point_qp_augmented_lagrangian_multi_corrector(G, c, A_equality, b_equality, A_inequality, b_inequality, 
+#                                                               seed=1, tol=1E-5, max_iterations=150, max_num_correctors=3,
+#                                                               x_0=x_0, slack_0=slack_0, dual_inequality_0=dual_inequality_0, 
+#                                                               dual_equality_0=dual_equality_0)
+
+    A_inequality = np.vstack((A_inequality, A_equality, -A_equality))
+    b_inequality = np.hstack((b_inequality, b_equality, -b_equality))
+    x_0, slack_0, dual_inequality_0 = ooqp_initialize_inequality(G, c, A_inequality, b_inequality)
+    x = interior_point_qp_inequality_multi_corrector(G, c, A_inequality, b_inequality, 
+                                                     seed=1, tol=1E-3, max_iterations=150, max_num_correctors=0,
+                                                     x_0=x_0, slack_0=slack_0, dual_inequality_0=dual_inequality_0)
